@@ -59,6 +59,8 @@ that is syntactically unbalanced.  Unbalanced double quotes that aren't part
 of a multiline literal will also confuse it.  You will receive warnings
 if there's an indent open at end of file or if a closer occurs with
 indent already zero; these two conditions strongly suggest unbalanced WML.
+The exit status is 1 if any warning was printed, so scripts and CI can
+catch them; the files are still reindented.
 """
 
 import sys, os, argparse, filecmp, re, signal
@@ -67,6 +69,15 @@ from wesnoth import version
 
 closer_prefixes = ["{NEXT "]
 opener_prefixes = ["{FOREACH "]
+
+# Number of warnings and errors printed, so the exit status can report them
+problems = 0
+
+def warn(message):
+    "Print a warning about the input and remember that there was one."
+    global problems
+    problems += 1
+    print(message, file=sys.stderr)
 
 def is_directive(str):
     "Identify things that shouldn't be indented."
@@ -132,6 +143,7 @@ def reindent(name, infp, outfp):
     in_lua = False
     seen_wml = False
     inmacro = False
+    ending_macro = False
     ignoring = False
     instring = False
     indent_level = 0
@@ -177,7 +189,7 @@ def reindent(name, infp, outfp):
         # Check if we're in the middle of a string concatenation
         if instring:
             if opener(transformed) or closer(transformed):
-                print('wmlindent: "%s", line %d: Expected string, received tag.' % (name, countlines), file=sys.stderr)
+                warn('wmlindent: "%s", line %d: Expected string, received tag.' % (name, countlines))
         # Track whether we've seen real WML rather than just macro definitions
         elif transformed.startswith("#define"):
             saved_indent = indent_level
@@ -185,8 +197,9 @@ def reindent(name, infp, outfp):
             inmacro = True
         # Be sure to ignore the newlines and comments
         elif transformed.rstrip().endswith("#enddef") and transformed.find("#") == transformed.find("#enddef"):
-            indent_level = saved_indent
-            inmacro = False
+            # Restored below, after a close tag before the #enddef (as in
+            # "[/if]#enddef") has been matched inside the macro
+            ending_macro = True
         elif not inmacro and transformed[0] in ('[', ']'):
             seen_wml = True
         # In the close case, we must compute new indent *before* emitting
@@ -194,9 +207,13 @@ def reindent(name, infp, outfp):
         # one that started the block.
         if closer(transformed):
             if indent_level == 0:
-                print('wmlindent: "%s", line %d: close tag %s with indent already zero.' % (name, countlines, transformed.strip()), file=sys.stderr)
+                warn('wmlindent: "%s", line %d: close tag %s with indent already zero.' % (name, countlines, transformed.strip()))
             else:
                 indent_level -= 1
+        if ending_macro:
+            indent_level = saved_indent
+            inmacro = False
+            ending_macro = False
         # Cope with blank lines outside of multiline literals
         if dostrip:
             if transformed == "\n":
@@ -248,7 +265,7 @@ def reindent(name, infp, outfp):
             lasttag = ""
     # Pure macro files look like they have unbalanced indents.  That's OK
     if indent_level != 0 and seen_wml:
-        print('wmlindent: "%s". line %d: end of file with indent nonzero (%d).' % (name, countlines, indent_level), file=sys.stderr)
+        warn('wmlindent: "%s". line %d: end of file with indent nonzero (%d).' % (name, countlines, indent_level))
 
 def allwmlfiles(directory):
     "Get names of all WML files under dir, or dir itself if not a directory."
@@ -264,13 +281,13 @@ def allwmlfiles(directory):
                 if name.endswith(".cfg"):
                     datafiles.append(os.path.join(root, name))
     elif not os.path.exists(directory):
-        print("wmlindent: path %s does not exist and will be skipped" % directory, file=sys.stderr)
+        warn("wmlindent: path %s does not exist and will be skipped" % directory)
     else:
         # please note that both os.path.isfile() and os.path.isdir() follow symlinks
         # and os.path.isdir() even covers mountpoints and drive letters
         # however, this point can be reached by using special paths
         # like /dev/null, /dev/random or /dev/zero on Linux
-        print("wmlindent: path %s is neither a file or a directory and will be skipped" % directory, file=sys.stderr)
+        warn("wmlindent: path %s is neither a file or a directory and will be skipped" % directory)
 
     return datafiles
 
@@ -292,11 +309,11 @@ def convertor(linefilter, arglist, exclude):
                         with open(filename,"r",encoding="utf8") as infp, open(filename + ".out","w",encoding="utf8") as outfp:
                             linefilter(filename, infp, outfp)
                     except bailout as e:
-                        print('wmlindent: "%s", %d: %s' % (e.filename, e.lineno, e.msg), file=sys.stderr)
+                        warn('wmlindent: "%s", %d: %s' % (e.filename, e.lineno, e.msg))
                         os.remove(filename + ".out")
                     except UnicodeDecodeError as e:
                         os.remove(filename + ".out")
-                        print('wmlindent: "{}" is not a valid UTF-8 file'.format(filename), file=sys.stderr)
+                        warn('wmlindent: "{}" is not a valid UTF-8 file'.format(filename))
                     except KeyboardInterrupt:
                         os.remove(filename + ".out")
                         print("wmlindent: %s interrupted" % filename, file=sys.stderr)
@@ -373,3 +390,6 @@ reindented WML on stdout.""")
             arguments[i] = arg[:-1]
     convertor(lambda n, f1, f2: reindent(n, f1, f2),
               arguments, "|".join(exclude))
+    # Reindenting still goes ahead, but a warning means the WML needs a look
+    if problems:
+        sys.exit(1)
